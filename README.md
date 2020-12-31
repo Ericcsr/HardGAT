@@ -5,7 +5,7 @@ This DGL example implements the GNN model proposed in the paper [CompositionGCN]
 
 HardGANet implementor
 ----------------------
-This example was implemented by [Ericcsr](https://github.com/Ericcsr) during his *** work at the AWS Shanghai AI Lab.
+This example was implemented by [Ericcsr](https://github.com/Ericcsr) during his Internship work at the AWS Shanghai AI Lab.
 
 The graph dataset used in this example 
 ---------------------------------------
