@@ -1,11 +1,11 @@
 # HardGAT
 ## DGL Implementation of h/cGAO paper.
 
-This DGL example implements the GNN model proposed in the paper [CompositionGCN](https://arxiv.org/abs/1907.04652.pdf). 
+This DGL example implements the GNN model proposed in the paper [HardGraphAttention](https://arxiv.org/abs/1907.04652.pdf). 
 
 HardGANet implementor
 ----------------------
-This example was implemented by [Ericcsr](https://github.com/Ericcsr) during his *** work at the AWS Shanghai AI Lab.
+This example was implemented by [Ericcsr](https://github.com/Ericcsr) during his Internship work at the AWS Shanghai AI Lab.
 
 The graph dataset used in this example 
 ---------------------------------------
