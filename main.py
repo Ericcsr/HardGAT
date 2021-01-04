@@ -12,10 +12,10 @@ import torch.optim as optim
 from dgl import function as fn
 from dgl.ops import edge_softmax
 from dgl.base import DGLError
-from dgl.utils import Identity
+from dgl.nn.pytorch.utils import Identity
 from dgl.utils import expand_as_pair
 from dgl.sampling import select_topk
-from dgl.nn.pytorch.conv import GraphConv
+from dgl.nn.pytorch.conv import GraphConv,GATConv
 from dgl.data import CoraGraphDataset
 
 from utils import Zeros
@@ -57,39 +57,34 @@ class HardGAO(nn.Module):
     def reset_parameters(self):
         # TODO: Maybe need exactly same initialization
         gain = nn.init.calculate_gain('relu')
-        if hasattr(self, 'fc'):
-            nn.init.xavier_normal_(self.fc.weight, gain=gain)
-        else:
-            nn.init.xavier_normal_(self.fc_src.weight, gain=gain)
-            nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
+        nn.init.xavier_normal_(self.fc.weight, gain=gain)
+        nn.init.xavier_normal_(self.p,gain=gain)
         nn.init.xavier_normal_(self.attn_l, gain=gain)
         nn.init.xavier_normal_(self.attn_r, gain=gain)
-        if isinstance(self.res_fc, nn.Linear):
-            nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
 
     def set_allow_zero_in_degree(self, set_value):
         self._allow_zero_in_degree = set_value
 
     def n2e_weight_transfer(self,edges):
         y = edges.src['y']
-        return {'e':y}
+        return {'y':y}
 
     def forward(self, graph, feat, get_attention=False):
             # projection process to get importance vector y
-            graph.ndata['y'] = th.abs(graph.ndata['ft'].T*self.p)/th.norm(self.p,p=2)
+            graph.ndata['y'] = th.abs(th.matmul(self.p,feat.T).view(-1))/th.norm(self.p,p=2)
             # Use edge message passing function to get the weight from src node
             graph.apply_edges(self.n2e_weight_transfer)
             # Select Top k neighbors
             subgraph = select_topk(graph,self.k,'y')
-
-            h_src = h_dst = self.feat_drop(feat)
-            feat_src = feat_dst = self.fc(h_src).view(
-                -1, self.num_heads, self.out_feats)
+            subgraph.ndata['y'] = th.sigmoid(subgraph.ndata['y'])
+            feat = th.matmul(th.diag(subgraph.ndata['y']),feat)
+            feat = self.feat_drop(feat)
+            feat = self.fc(feat).view(-1, self.num_heads, self.out_feats)
         
-            el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
-            er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
+            el = (feat * self.attn_l).sum(dim=-1).unsqueeze(-1)
+            er = (feat * self.attn_r).sum(dim=-1).unsqueeze(-1)
             # Assign the value on the subgraph
-            subgraph.srcdata.update({'ft': feat_src, 'el': el})
+            subgraph.srcdata.update({'ft': feat, 'el': el})
             subgraph.dstdata.update({'er': er})
 
             # compute edge attention, el and er are a_l Wh_i and a_r Wh_j respectively.
@@ -101,6 +96,7 @@ class HardGAO(nn.Module):
             subgraph.update_all(fn.u_mul_e('ft', 'a', 'm'),
                              fn.sum('m', 'ft'))
             rst = subgraph.dstdata['ft']
+            
             # activation
             if self.activation:
                 rst = self.activation(rst)
@@ -144,7 +140,7 @@ class HardGAM(nn.Module):
                             negative_slope=self.negative_slope
         )
         # As paper described the GCN should be weight free
-        self.gcn = GraphConv(hid_dim,out_dim,weight=False,bias=False)
+        self.gcn = GraphConv(self.hid_dim,self.out_dim,weight=True,bias=False)
         # Implementation of residual as in Kaiming He ResNet
         if self.residual:
             if self.hid_dim==self.out_dim:
@@ -154,9 +150,10 @@ class HardGAM(nn.Module):
     
     def forward(self,g,n_feats):
         h = self.hgao(g,n_feats)
+        h = h.view(h.shape[0],h.shape[1]*h.shape[2])
         ret = self.gcn(g,h)
         if self.residual:
-            ret = ret+self.res_m(n_feats).view(n_feats.shape[0], -1, self.out_dim)
+            ret = ret+self.res_m(n_feats)
         return ret
 
 class HardGANet(nn.Module):
@@ -173,6 +170,7 @@ class HardGANet(nn.Module):
                  attn_dropout=0.,
                  negative_slope=0.2
                  ):
+        super(HardGANet,self).__init__()
         self.in_dim = in_dim
         self.intm_dim= intm_dim
         self.hid_dim= hid_dim
@@ -195,7 +193,7 @@ class HardGANet(nn.Module):
             else:
                 current_dim = hid_dim
             hgam = HardGAM(current_dim,
-                           hid_dim,
+                           current_dim,
                            hid_dim,
                            residual=self.module_residual,
                            k=self.k,
@@ -217,7 +215,7 @@ class HardGANet(nn.Module):
     def forward(self,g, n_feats):
         h = self.layers[0](g,n_feats)
         for n in range(self.num_module):
-            h = self.layers[n+1](g,h)+self.res[min(1,n)](h)
+            h = self.layers[n+1](g,h) + self.res[min(1,n)](h)
         out = self.layers[-1](g,h)
         return out
 
@@ -241,7 +239,8 @@ def main(args):
     num_classes = dataset.num_classes
     labels = graph.ndata.pop('label').to(device).long()
 
-    n_feats = graph.ndata.pop('train_mask')
+
+    n_feats = graph.ndata.pop('feat').to(device)
     in_dim  = n_feats.shape[-1]
 
     train_mask = graph.ndata.pop('train_mask')
@@ -256,16 +255,16 @@ def main(args):
     hgat_model.to(device)
 
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(hgat_model.parameters(),lr=args.lr,weight_decay=5e-4)
+    optimizer = optim.Adam(hgat_model.parameters(),lr=args.lr,weight_decay=0.002)
 
     for epoch in range(args.max_epoch):
         hgat_model.train()
         logits = hgat_model.forward(graph,n_feats)
         tr_loss = loss_fn(logits[train_idx],labels[train_idx])
-        tr_acc  = th.sum(logits[train_idx]==labels[train_idx]).item()/len(train_idx)
+        tr_acc  = th.sum(th.argmax(logits[train_idx],1)==labels[train_idx]).item()/len(train_idx)
 
         valid_loss = loss_fn(logits[val_idx],labels[val_idx])
-        valid_acc  = th.sum(logits[val_idx]==labels[val_idx]).item()/len(train_idx)
+        valid_acc  = th.sum(th.argmax(logits[val_idx],1)==labels[val_idx]).item()/len(val_idx)
 
         optimizer.zero_grad()
         tr_loss.backward()
@@ -285,7 +284,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='MVP hGANet for Node Classification')
     parser.add_argument('--dataset',type=str,default="cora",help="DGL dataset for this MVP")
-    parser.add_arguemnt('--gpu',type=int,default=-1,help="GPU Index, Default: -1 Using CPU")
+    parser.add_argument('--gpu',type=int,default=-1,help="GPU Index, Default: -1 Using CPU")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate. Default: 3e-1")
     parser.add_argument("--max_epoch", type=int, default=100, help="The max number of epoches. Default: 100")
     parser.add_argument("--num_module", type=int, default=4, help="The number of hGAO modules in GANet. Default: 4")
